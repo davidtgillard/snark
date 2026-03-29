@@ -1,2 +1,5 @@
 # lagado
-A product roadmapping tool for developers
+
+## About
+
+*Some snarks are highly dangerous boojums*
