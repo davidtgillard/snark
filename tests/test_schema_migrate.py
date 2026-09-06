@@ -14,6 +14,7 @@ from bellman.graph.schema_migrate import (
     migrate_registry_schema,
     registry_needs_schema_migration,
     registry_needs_work_scope_parent_migration,
+    remove_obsolete_link_types,
 )
 
 
@@ -324,3 +325,47 @@ def test_migrate_rmtree_nodes_failure(tmp_path: Path) -> None:
         result = migrate_registry_schema(tmp_path)
     assert isinstance(result, Err)
     assert result.err_value.code == "schema_migration_failed"
+
+
+def test_remove_obsolete_link_types_strips_promoted_from(tmp_path: Path) -> None:
+    _write_registry(
+        tmp_path,
+        {
+            "nested_link_types": [
+                {
+                    "link_type": "promoted_from",
+                    "in_type": "project",
+                    "out_type": "initiative",
+                    "next": 1,
+                },
+                {
+                    "link_type": "parent_of",
+                    "in_type": "work_package",
+                    "out_type": "work_package",
+                    "next": 1,
+                },
+            ],
+            "instances": [
+                {
+                    "guid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "name": "promoted_from-1",
+                    "type": "promoted_from",
+                    "kind": "link",
+                }
+            ],
+        },
+    )
+    result = remove_obsolete_link_types(tmp_path)
+    assert isinstance(result, Ok)
+    assert result.ok_value == {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+    data = json.loads(
+        (tmp_path / ".fits" / "registry.json").read_text(encoding="utf-8")
+    )
+    assert all(
+        entry.get("link_type") != "promoted_from"
+        for entry in data.get("nested_link_types", [])
+    )
+    assert all(
+        inst.get("guid") != "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        for inst in data.get("instances", [])
+    )

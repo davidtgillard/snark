@@ -138,6 +138,38 @@ class InstanceIndex:
             children[inst.guid] = inst
         return Id(_wire_guid(record, children))
 
+    def guid_for_work_scope_name(self, name: str) -> Id | None:
+        """Return the wire id for ``initiative/{name}`` or ``project/{name}``.
+
+        Initiatives and projects share a local name under ``work_scope`` but only
+        one incarnation is live at a time.
+
+        Args:
+            name: Work-scope natural name (kebab-case).
+
+        Returns:
+            Wire id when either logical path is registered, else ``None``.
+        """
+        for type_name in ("initiative", "project"):
+            guid = self.guid_for_name(f"{type_name}/{name}")
+            if guid is not None:
+                return guid
+        return None
+
+    def child_guid_for_logical(self, logical_name: str) -> str | None:
+        """Return the registry child GUID for a logical node path.
+
+        Args:
+            logical_name: Qualified node path (for example ``project/foo``).
+
+        Returns:
+            Child GUID string when ``logical_name`` is a live node, else ``None``.
+        """
+        record = self.by_name.get(logical_name)
+        if record is None or record.kind != "node":
+            return None
+        return record.guid
+
     def name_for_guid(self, guid: str) -> str | None:
         """Return the logical instance name for a wire guid, if known."""
         record = self.by_guid.get(guid)

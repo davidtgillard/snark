@@ -229,13 +229,6 @@
       "tombstones": []
     },
     {
-      "link_type": "promoted_from",
-      "in_type": "project",
-      "out_type": "initiative",
-      "next": 1,
-      "tombstones": []
-    },
-    {
       "link_type": "supports",
       "in_type": "project",
       "out_type": "goal",

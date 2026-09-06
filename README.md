@@ -119,7 +119,7 @@ bellman report deps initiatives/beta
 
 `create`, `delete`, `rename`, `promote`, and `demote` update the pyfits graph and `.fits/registry.json` directly when libfits is installed. Run `bellman init` first; `sync` will not bootstrap pyfits artifacts. If graph sync fails after a markdown change, the command exits with code 1; the markdown file is still written. When libfits is not available, those commands only change markdown and print a note. `delete` also prunes the removed entity from the graph; use `bellman sync` to reconcile other manual edits.
 
-`demote` parks the whole project directory as `projects/{name}.archived/` (work packages and extra files included) and restores `initiatives/{name}.md`. A later `promote` of the same name restores that folder instead of creating an empty one.
+`demote` parks the whole project directory as `projects/{name}.archived/` (work packages and extra files included) and restores `initiatives/{name}.md`. A later `promote` of the same name restores that folder instead of creating an empty one. Promote and demote keep the same pyfits GUID and flip `instances[].type`; git history of `.fits/registry.json` is the type change.
 
 `rename` moves the entity on disk (initiative, project, milestone, or goal), rewrites dependency references that name the old entity, and renames the matching pyfits instance (GUID preserved). Entity-targeting commands (`promote`, `demote`, `delete`, `rename`, `report deps`, `report wbs --project`) accept a bare name when it is unambiguous across types, a layout FQN such as `projects/foo` or `initiatives/foo`, a folder path (`projects/foo`), or the main markdown path (`projects/foo/foo.md`, `goals/foo.md`). Graph FQNs (`project/foo`, `goal/foo`) work as well. Use a type subcommand when initiative and goal (for example) share a name: `bellman rename goal foo bar`.
 
@@ -171,11 +171,13 @@ from bellman.plugin import (
     TextIO,
 )
 
+
 def run(ctx: BellmanContext, args: PluginArguments, io: TextIO) -> int:
     for scope in ctx.roadmap().all_work_scopes():
         for edge in scope.dependencies:
             io.writeline(f"{edge.predecessor} -> {edge.successor}")
     return 0
+
 
 PLUGIN = BellmanPlugin(
     name="report-deps",

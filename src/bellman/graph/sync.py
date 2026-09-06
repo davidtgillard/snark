@@ -41,11 +41,15 @@ from bellman.graph.links_file import reconcile_link_artifacts
 from bellman.graph.registry import (
     KIND_TYPE,
     WORK_SCOPE_KIND_ROOT,
+    bellman_link_types,
     bootstrap_registry,
     ensure_kind_roots,
-    markdown_sync_link_types,
+    precedes_scope_link_types,
 )
-from bellman.graph.schema_migrate import migrate_registry_schema
+from bellman.graph.schema_migrate import (
+    migrate_registry_schema,
+    remove_obsolete_link_types,
+)
 from bellman.model import Goal, Initiative, Milestone, Project, Roadmap
 from bellman.parse.goal import parse_goal
 from bellman.parse.milestone import parse_milestone
@@ -73,6 +77,26 @@ def _container_logical_name(type_name: str, logical_name: str) -> str | None:
     if type_name in {"initiative", "project"}:
         return WORK_SCOPE_KIND_ROOT
     return _parent_logical_path(logical_name)
+
+
+_WORK_SCOPE_TYPES = frozenset({"initiative", "project"})
+_PROJECT_ONLY_LINK_TYPES = frozenset({"supports", "targets"})
+
+
+def _prepare_registry_files(root: Path) -> Result[None, FitsError]:
+    """Migrate schema and strip obsolete link types before opening a repo."""
+    migrated = migrate_registry_schema(root)
+    if isinstance(migrated, Err):
+        return migrated
+    obsolete_links = remove_obsolete_link_types(root)
+    if isinstance(obsolete_links, Err):
+        return obsolete_links
+    if not obsolete_links.ok_value:
+        return Ok(None)
+    reconciled = reconcile_link_artifacts(root, drop_link_guids=obsolete_links.ok_value)
+    if isinstance(reconciled, Err):
+        return reconciled
+    return Ok(None)
 
 
 def _bootstrap_session(repo: Repo, root: Path) -> Result[None, FitsError]:
@@ -197,7 +221,7 @@ def _prune_stale_graph(
         return Err(_history_to_fits_error(index_result.err_value))
     index = index_result.ok_value
 
-    prune_link_types = markdown_sync_link_types()
+    prune_link_types = bellman_link_types()
     stale_managed_links = [
         edge
         for edge in graph.edges
@@ -351,47 +375,38 @@ def _park_and_remove_instance(
     return ignore_nothing_to_remove(repo.remove(guid))
 
 
-def _remove_demoted_project_graph(
+def _work_package_logical_names(project_name: str, root: Path) -> set[str]:
+    """Return live work-package logical names nested under a project."""
+    project_logical = entity_node_id("project", project_name)
+    prefix = f"{project_logical}/"
+    return {
+        logical_name
+        for logical_name in _deleted_node_names("project", project_name, root)
+        if logical_name.startswith(prefix)
+    }
+
+
+def _remove_nested_work_packages(
     repo: Repo,
     root: Path,
-    graph: Graph,
-    name: str,
-) -> Result[Graph, FitsError]:
-    """Remove a parked project's graph nodes and nested work packages.
-
-    Nested initiative and project instances share the ``work_scope`` parent, so
-    the project is renamed aside before removal. Otherwise libfits tombstones
-    the original name and creating ``initiative/{name}`` fails.
+    project_name: str,
+) -> Result[None, FitsError]:
+    """Park and remove all work-package nodes under a project.
 
     Args:
         repo: Open pyfits repository session.
         root: Roadmap root directory.
-        graph: Current graph snapshot; returned unchanged when nothing is removed.
-        name: Project natural name (kebab-case).
+        project_name: Project natural name (kebab-case).
 
     Returns:
-        ``Ok(graph)`` with a reloaded snapshot when nodes were removed, or the
-        original ``graph`` when no matching instances existed.
-        ``Err(FitsError)`` when link repair or node removal fails.
+        ``Ok(None)`` when work packages are removed or none exist.
+        ``Err(FitsError)`` when removal fails.
     """
-    node_names = _deleted_node_names("project", name, root)
-    reconciled = reconcile_link_artifacts(root, drop_touching_nodes=node_names)
-    if isinstance(reconciled, Err):
-        return reconciled
+    wp_names = _work_package_logical_names(project_name, root)
     index_result = InstanceIndex.load(root)
     if isinstance(index_result, Err):
         return Err(_history_to_fits_error(index_result.err_value))
     index = index_result.ok_value
-    project_logical = entity_node_id("project", name)
-    project_guid = index.guid_for_name(project_logical)
-    if project_guid is None:
-        return Ok(graph)
-
-    wp_names = {
-        logical_name
-        for logical_name in node_names
-        if logical_name.startswith(f"{project_logical}/")
-    }
     for logical_name in sorted(
         wp_names,
         key=lambda node: node.count("/"),
@@ -404,17 +419,167 @@ def _remove_demoted_project_graph(
         parked_wp = _park_and_remove_instance(repo, guid, base_name=slug)
         if isinstance(parked_wp, Err):
             return parked_wp
+    return Ok(None)
 
-    # Nested work_scope siblings share a name namespace. Removing the project
-    # under its original name tombstones that name; park first so demote can
-    # create initiative/{name}.
-    parked = _park_and_remove_instance(repo, project_guid, base_name=name)
-    if isinstance(parked, Err):
-        return parked
+
+def _retype_drop_link_types(to_type: str) -> frozenset[str]:
+    """Link types that cannot remain after retyping a work-scope to ``to_type``."""
+    types: set[str] = set(precedes_scope_link_types())
+    if to_type == "initiative":
+        types |= _PROJECT_ONLY_LINK_TYPES
+    return frozenset(types)
+
+
+def _drop_incident_links(
+    repo: Repo,
+    root: Path,
+    graph: Graph,
+    guid: Id,
+    link_types: frozenset[str],
+) -> Result[Graph, FitsError]:
+    """Remove incident links of ``link_types`` so libfits can retype ``guid``.
+
+    ``precedes_*_scope`` links are registered as ``project``→``project``.
+    ``supports`` / ``targets`` are project-typed. Sync recreates markdown
+    scope edges afterward.
+
+    Args:
+        repo: Open pyfits repository session.
+        root: Roadmap root directory.
+        graph: Current graph snapshot.
+        guid: Work-scope wire id whose incident links may be dropped.
+        link_types: Link type names to remove when incident on ``guid``.
+
+    Returns:
+        ``Ok(graph)`` unchanged or reloaded after removals.
+        ``Err(FitsError)`` when link removal fails.
+    """
+    stale_link_guids: set[str] = set()
+    for edge in graph.edges:
+        if edge.link_type not in link_types:
+            continue
+        if edge.id is None:
+            continue
+        if not (_same_endpoint(edge.from_id, guid) or _same_endpoint(edge.to_id, guid)):
+            continue
+        stale_link_guids.add(edge.id.value)
+        stale_link_guids.add(edge.id.value.rsplit("/", 1)[-1])
+        removed = ignore_nothing_to_remove(repo.remove(edge.id))
+        if isinstance(removed, Err):
+            return Err(removed.err_value)
+
+    if not stale_link_guids:
+        return Ok(graph)
+
+    reconciled = reconcile_link_artifacts(root, drop_link_guids=stale_link_guids)
+    if isinstance(reconciled, Err):
+        return reconciled
     reloaded = _reload_graph(repo)
     if isinstance(reloaded, Err):
         return reloaded
     return Ok(reloaded.ok_value)
+
+
+def _retype_work_scope(
+    repo: Repo,
+    root: Path,
+    graph: Graph,
+    name: str,
+    *,
+    from_type: str,
+    to_type: str,
+) -> Result[Graph, FitsError]:
+    """Change a work-scope instance type while preserving GUID and local name.
+
+    Args:
+        repo: Open pyfits repository session.
+        root: Roadmap root directory.
+        graph: Current graph snapshot.
+        name: Work-scope natural name (kebab-case).
+        from_type: Expected current type (``initiative`` or ``project``).
+        to_type: Target type (``initiative`` or ``project``).
+
+    Returns:
+        ``Ok(graph)`` when the instance is retyped or already has ``to_type``.
+        ``Err(FitsError)`` when libfits retype fails.
+    """
+    index_result = InstanceIndex.load(root)
+    if isinstance(index_result, Err):
+        return Err(_history_to_fits_error(index_result.err_value))
+    guid = index_result.ok_value.guid_for_name(entity_node_id(from_type, name))
+    if guid is None:
+        return Ok(graph)
+
+    dropped = _drop_incident_links(
+        repo,
+        root,
+        graph,
+        guid,
+        _retype_drop_link_types(to_type),
+    )
+    if isinstance(dropped, Err):
+        return dropped
+
+    changed = repo.change_instance_type(
+        guid=guid,
+        new_type=ObjectTypeName(to_type),
+    )
+    if isinstance(changed, Err):
+        return Err(changed.err_value)
+    reloaded = _reload_graph(repo)
+    if isinstance(reloaded, Err):
+        return reloaded
+    return Ok(reloaded.ok_value)
+
+
+def _retype_parked_project_to_initiative(
+    repo: Repo,
+    root: Path,
+    graph: Graph,
+    name: str,
+) -> Result[Graph, FitsError]:
+    """Retype a parked project back to an initiative; drop nested work packages.
+
+    Work scopes share a local name under ``work_scope``. Demote keeps the same
+    GUID and flips ``project`` → ``initiative`` after removing work packages.
+
+    Args:
+        repo: Open pyfits repository session.
+        root: Roadmap root directory.
+        graph: Current graph snapshot; returned unchanged when nothing changes.
+        name: Project natural name (kebab-case).
+
+    Returns:
+        ``Ok(graph)`` with a reloaded snapshot when nodes were changed, or the
+        original ``graph`` when no matching project instance existed.
+        ``Err(FitsError)`` when link repair or retype fails.
+    """
+    index_result = InstanceIndex.load(root)
+    if isinstance(index_result, Err):
+        return Err(_history_to_fits_error(index_result.err_value))
+    if index_result.ok_value.guid_for_name(entity_node_id("project", name)) is None:
+        return Ok(graph)
+
+    wp_names = _work_package_logical_names(name, root)
+    if wp_names:
+        reconciled = reconcile_link_artifacts(root, drop_touching_nodes=wp_names)
+        if isinstance(reconciled, Err):
+            return reconciled
+    removed_wps = _remove_nested_work_packages(repo, root, name)
+    if isinstance(removed_wps, Err):
+        return removed_wps
+    reloaded = _reload_graph(repo)
+    if isinstance(reloaded, Err):
+        return reloaded
+    graph = reloaded.ok_value
+    return _retype_work_scope(
+        repo,
+        root,
+        graph,
+        name,
+        from_type="project",
+        to_type="initiative",
+    )
 
 
 def _rename_graph_kind(kind: str) -> str:
@@ -463,6 +628,10 @@ def prune_deleted_entity(
                 code="not_initialized",
             )
         )
+
+    prepared = _prepare_registry_files(root)
+    if isinstance(prepared, Err):
+        return prepared
 
     try:
         node_names = _deleted_node_names(kind, name, root)
@@ -607,6 +776,10 @@ def sync_renamed_entity(
             )
         )
 
+    prepared = _prepare_registry_files(root)
+    if isinstance(prepared, Err):
+        return prepared
+
     old_logical = entity_node_id(type_name, old_name)
     new_logical = entity_node_id(type_name, new_name)
 
@@ -693,6 +866,10 @@ def sync_created_entity(
                 code="not_initialized",
             )
         )
+
+    prepared = _prepare_registry_files(root)
+    if isinstance(prepared, Err):
+        return prepared
 
     parsed = _parse_created_entity(root, kind, name)
     if isinstance(parsed, Err):
@@ -808,8 +985,13 @@ def _ensure_node(
         assert guid is not None
         return Ok(CreatedObject(guid=guid, name=logical_name))
 
-    parent_path = _container_logical_name(type_name, logical_name)
     local_name = local_name_from_node_id(logical_name)
+    if type_name in _WORK_SCOPE_TYPES:
+        existing = index.guid_for_work_scope_name(local_name)
+        if existing is not None:
+            return Ok(CreatedObject(guid=existing, name=logical_name))
+
+    parent_path = _container_logical_name(type_name, logical_name)
     container_guid: Id | None = None
     if parent_path is not None:
         container_guid = index.guid_for_name(parent_path)
@@ -1037,6 +1219,9 @@ def init_pyfits_repo(root: Path) -> Result[None, FitsError]:
                 code="lib_not_found",
             )
         )
+    prepared = _prepare_registry_files(root)
+    if isinstance(prepared, Err):
+        return prepared
     open_result = Repo.open(root)
     if isinstance(open_result, Err):
         return open_result
@@ -1090,10 +1275,11 @@ def sync_roadmap(
     except (ValueError, OSError) as exc:
         return Err(FitsError(str(exc), code="roadmap_load_failed"))
 
-    # Schema migration may rewrite registry.json; run before opening a long session.
-    pre = migrate_registry_schema(root)
-    if isinstance(pre, Err):
-        return pre
+    # Schema migration and obsolete-link cleanup rewrite registry.json; run
+    # before opening a long session.
+    prepared = _prepare_registry_files(root)
+    if isinstance(prepared, Err):
+        return prepared
 
     open_result = Repo.open(root)
     if isinstance(open_result, Err):
@@ -1119,7 +1305,7 @@ def sync_roadmap(
         for initiative in roadmap.initiatives:
             if not layout.archived_project_dir(root, initiative.name).is_dir():
                 continue
-            removed = _remove_demoted_project_graph(
+            removed = _retype_parked_project_to_initiative(
                 repo,
                 root,
                 graph,
@@ -1157,22 +1343,21 @@ def sync_roadmap(
 
         for project in roadmap.projects:
             if layout.archived_initiative_path(root, project.name).exists():
-                index_result = InstanceIndex.load(root)
-                if isinstance(index_result, Ok):
-                    init_logical = entity_node_id("initiative", project.name)
-                    init_guid = index_result.ok_value.guid_for_name(init_logical)
-                    if init_guid is not None:
-                        parked = _park_and_remove_instance(
-                            repo,
-                            init_guid,
-                            base_name=project.name,
-                        )
-                        if isinstance(parked, Err):
-                            return parked
-                        reloaded = _reload_graph(repo)
-                        if isinstance(reloaded, Err):
-                            return reloaded
-                        graph = reloaded.ok_value
+                retyped = _retype_work_scope(
+                    repo,
+                    root,
+                    graph,
+                    project.name,
+                    from_type="initiative",
+                    to_type="project",
+                )
+                if isinstance(retyped, Err):
+                    return retyped
+                graph = retyped.ok_value
+                reloaded = _reload_graph(repo)
+                if isinstance(reloaded, Err):
+                    return reloaded
+                graph = reloaded.ok_value
             res = _ensure_node(
                 repo,
                 root,

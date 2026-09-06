@@ -250,3 +250,91 @@ def migrate_registry_schema(root: Path) -> Result[None, FitsError]:
 def is_kind_root_name(logical_name: str) -> bool:
     """Return True when ``logical_name`` is a kind-root path segment."""
     return logical_name in KIND_ROOT_NAMES
+
+
+_OBSOLETE_LINK_TYPES = frozenset({"promoted_from"})
+
+
+def remove_obsolete_link_types(root: Path) -> Result[set[str], FitsError]:
+    """Drop retired link types and instances from the registry file.
+
+    Removes ``promoted_from`` nested/root link type rows and matching live
+    link instances. Call before opening a long-lived repo session; pass
+    returned GUIDs to ``reconcile_link_artifacts`` so subgraph and
+    ``links.jsonc`` rows are dropped.
+
+    Args:
+        root: Roadmap root directory.
+
+    Returns:
+        ``Ok(guids)`` with child GUIDs of removed link instances (possibly empty).
+        ``Err(FitsError)`` when the registry cannot be read or written.
+    """
+    path = root / _REGISTRY_PATH
+    if not path.is_file():
+        return Ok(set())
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return Err(FitsError(str(exc), code="schema_migration_failed"))
+    if not isinstance(data, dict):
+        return Ok(set())
+
+    stale_guids: set[str] = set()
+    changed = False
+    instances = data.get("instances")
+    if isinstance(instances, list):
+        kept_instances: list[Any] = []
+        for inst in instances:
+            if not isinstance(inst, dict):
+                kept_instances.append(inst)
+                continue
+            type_name = inst.get("type")
+            guid = inst.get("guid")
+            if (
+                inst.get("kind") == "link"
+                and type_name in _OBSOLETE_LINK_TYPES
+                and isinstance(guid, str)
+            ):
+                stale_guids.add(guid)
+                continue
+            kept_instances.append(inst)
+        if len(kept_instances) != len(instances):
+            data["instances"] = kept_instances
+            changed = True
+
+    nested = data.get("nested_link_types")
+    if isinstance(nested, list):
+        filtered = [
+            entry
+            for entry in nested
+            if not (
+                isinstance(entry, dict)
+                and entry.get("link_type") in _OBSOLETE_LINK_TYPES
+            )
+        ]
+        if len(filtered) != len(nested):
+            data["nested_link_types"] = filtered
+            changed = True
+
+    root_links = data.get("link_types")
+    if isinstance(root_links, list):
+        filtered_root = [
+            entry
+            for entry in root_links
+            if not (
+                isinstance(entry, dict)
+                and entry.get("link_type") in _OBSOLETE_LINK_TYPES
+            )
+        ]
+        if len(filtered_root) != len(root_links):
+            data["link_types"] = filtered_root
+            changed = True
+
+    if changed:
+        try:
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            return Err(FitsError(str(exc), code="schema_migration_failed"))
+
+    return Ok(stale_guids)

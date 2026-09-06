@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 from typing import Annotated
 
-import click
 import typer
 
 from bellman import layout
@@ -118,8 +117,8 @@ def register_plugin_command(app: typer.Typer) -> None:
 
         root = _root(path)
         io = TextIO(
-            output_stream=click.get_text_stream("stdout"),
-            error_stream=click.get_text_stream("stderr"),
+            output_stream=sys.stdout,
+            error_stream=sys.stderr,
         )
 
         if args[0] == "list":

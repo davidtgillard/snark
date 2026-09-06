@@ -283,14 +283,14 @@ def test_prune_stale_graph_stale_edge_remove_err() -> None:
         from_id=Id("keep-guid"),
         to_id=Id("gone-guid"),
         kind="registered_link",
-        link_type="promoted_from",
+        link_type="parent_of",
         id=Id("edge-guid"),
     )
     null_id_edge = GraphEdge(
         from_id=Id("keep-guid"),
         to_id=Id("gone-guid"),
         kind="registered_link",
-        link_type="promoted_from",
+        link_type="parent_of",
         id=None,
     )
     graph = Graph(nodes=(), edges=(null_id_edge, edge))
@@ -324,7 +324,7 @@ def test_prune_stale_graph_stale_edge_reload_err() -> None:
         from_id=Id("keep-guid"),
         to_id=Id("gone-guid"),
         kind="registered_link",
-        link_type="promoted_from",
+        link_type="parent_of",
         id=Id("edge-guid"),
     )
     graph = Graph(nodes=(), edges=(edge,))
@@ -1297,6 +1297,31 @@ def test_ensure_node_already_present() -> None:
         )
     assert isinstance(result, Ok)
     assert result.ok_value.guid.value == "g"
+    repo.new_node.assert_not_called()
+
+
+def test_ensure_node_reuses_work_scope_guid() -> None:
+    repo = MagicMock()
+    index = _index(
+        InstanceRecord(
+            guid="init-guid",
+            instance_name="foo",
+            type_name="initiative",
+            kind="node",
+            parent_guid="ws-guid",
+        ),
+    )
+    with patch("bellman.graph.sync.InstanceIndex.load", return_value=Ok(index)):
+        result = _ensure_node(
+            repo,
+            Path("/tmp"),
+            Graph(nodes=(), edges=()),
+            type_name="project",
+            logical_name="project/foo",
+            title="Foo",
+        )
+    assert isinstance(result, Ok)
+    assert result.ok_value.guid == index.guid_for_work_scope_name("foo")
     repo.new_node.assert_not_called()
 
 

@@ -34,6 +34,15 @@ def precedes_link_types() -> list[str]:
     return types
 
 
+def precedes_scope_link_types() -> frozenset[str]:
+    """Return nested scope-precedence link type names (``precedes_*_scope``).
+
+    Returns:
+        Frozen set of ``precedes_{relation}_{hardness}_scope`` type names.
+    """
+    return frozenset(f"{lt}_scope" for lt in precedes_link_types())
+
+
 def hardness_suffix(hard: Hardness) -> str:
     """Wire-safe hardness label for link type names."""
     return hard.value
@@ -46,16 +55,11 @@ def bellman_node_types() -> frozenset[str]:
 
 def bellman_link_types() -> frozenset[str]:
     """Link type names managed by bellman roadmap sync."""
-    types: set[str] = {"parent_of", "promoted_from"}
+    types: set[str] = {"parent_of"}
     for lt in precedes_link_types():
         types.add(lt)
         types.add(f"{lt}_scope")
     return frozenset(types)
-
-
-def markdown_sync_link_types() -> frozenset[str]:
-    """Link types derived from markdown and pruned during ``sync_roadmap``."""
-    return frozenset(t for t in bellman_link_types() if t != "promoted_from")
 
 
 def bootstrap_registry(repo: Repo) -> Result[None, FitsError]:
@@ -87,7 +91,6 @@ def bootstrap_registry(repo: Repo) -> Result[None, FitsError]:
         repo.register_link_type("targets", "project", "milestone"),
         repo.register_link_type("targets_wp", "work_package", "milestone"),
         repo.register_link_type("parent_of", "work_package", "work_package"),
-        repo.register_link_type("promoted_from", "project", "initiative"),
     ]
     for rel in RelationType:
         for hard in Hardness:
